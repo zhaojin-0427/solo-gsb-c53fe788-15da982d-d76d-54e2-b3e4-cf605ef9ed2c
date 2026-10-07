@@ -10,7 +10,8 @@ services:
       ANON_SECRET: ${ANON_SECRET:-change-me-in-production}
       DATA_DIR: /data
       # Crash-recovery tuning (optional): how long an executor's lease on a
-      # job stays valid without a heartbeat, and how often it heartbeats.
+      # job stays valid without a heartbeat (doubles as the instance-liveness
+      # window), and how often it heartbeats.
       # JOB_LEASE_SECONDS: ${JOB_LEASE_SECONDS:-30}
       # JOB_HEARTBEAT_SECONDS: ${JOB_HEARTBEAT_SECONDS:-10}
     volumes:

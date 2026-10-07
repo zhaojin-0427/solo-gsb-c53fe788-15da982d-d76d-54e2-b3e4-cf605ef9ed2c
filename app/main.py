@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -152,6 +153,75 @@ def _remove_stale_tmp_files(results_dir: str) -> None:
                 pass
 
 
+def _instance_heartbeat_loop(
+    store: JobStore, worker_id: str, interval: float, stop: threading.Event
+) -> None:
+    """Keep this instance's liveness registration fresh while it runs.
+
+    Peers sharing the DATA_DIR use the registration to verify whether a lease
+    owner is still alive: a registration that stops being renewed means the
+    instance is gone, and only then may its leases be invalidated or claimed.
+    """
+    if interval <= 0:
+        return
+    while not stop.wait(interval):
+        try:
+            store.heartbeat_instance(worker_id)
+        except Exception:
+            return  # store is gone (e.g. test teardown); nothing to renew
+
+
+def _await_lease_resolution(
+    store: JobStore,
+    job_id: str,
+    secret_fp: str,
+    worker_id: str,
+    settings: Settings,
+    record: dict,
+) -> tuple[str, dict]:
+    """Arbitrate with a registered peer instance that holds the job's lease.
+
+    Called when a resubmission finds the job leased to another *registered*
+    instance and could not claim it outright, so the previous executor's fate
+    is not yet decidable. Polls until the situation resolves:
+
+    * ``claimed``  — the lease lapsed or the owner's registration went stale,
+      and this process won the atomic takeover (SQLite serializes concurrent
+      claimants, so exactly one wins); the caller must (re)schedule execution;
+    * ``active``   — the owner proved itself alive: its lease or its liveness
+      registration advanced during the wait. The job is being executed and
+      must not be preempted;
+    * ``terminal`` — the job reached done/failed meanwhile;
+    * ``timeout``  — a safety bound was hit; the caller reports the job as-is.
+
+    The wait is naturally bounded: a dead owner stops renewing, so its lease
+    lapses (and its registration goes stale) within ``lease_seconds`` of its
+    death, at which point the takeover proceeds.
+    """
+    lease_seconds = settings.lease_seconds
+    owner = record["lease_owner"]
+    baseline_lease = record["lease_expires"] or 0.0
+    baseline_seen = store.instance_last_seen(owner)
+    deadline = time.time() + lease_seconds + settings.heartbeat_seconds + 5.0
+    while True:
+        latest = store.get(job_id)
+        if latest is None or latest["status"] in ("done", "failed"):
+            return "terminal", (latest or record)
+        if store.try_claim(
+            job_id, secret_fp, worker_id, time.time() + lease_seconds, lease_seconds
+        ):
+            return "claimed", store.get(job_id)
+        if (latest["lease_expires"] or 0.0) > baseline_lease:
+            return "active", latest  # lease renewed: the owner is alive
+        if baseline_seen is not None:
+            seen = store.instance_last_seen(owner)
+            if seen is not None and seen > baseline_seen:
+                return "active", latest  # liveness heartbeat advanced: alive
+        if time.time() >= deadline:
+            return "timeout", latest
+        time.sleep(0.5)
+
+
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     settings = settings or get_settings()
     os.makedirs(settings.data_dir, exist_ok=True)
@@ -160,19 +230,41 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     store = JobStore(os.path.join(settings.data_dir, "jobs.db"))
     # Identity of this service instance for lease arbitration.
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
-    # Single-instance deployment model: a new process on this DATA_DIR means
-    # the previous instance is gone. Invalidate its in-flight leases so its
-    # interrupted jobs become claimable on the very next resubmission instead
-    # of only after the lease timeout.
-    store.expire_foreign_leases(worker_id)
+    # Publish this instance's liveness, then invalidate only leases whose
+    # owner is verifiably gone (unregistered or long-silent). Leases of live
+    # peer instances sharing this DATA_DIR are left untouched, so a second
+    # instance starting up can never preempt jobs that are still executing.
+    store.register_instance(worker_id)
+    store.expire_foreign_leases(worker_id, settings.lease_seconds)
     _remove_stale_tmp_files(results_dir)
     runner = _JobRunner(store, results_dir, settings, worker_id)
+
+    heartbeat_stop = threading.Event()
+    heartbeat = threading.Thread(
+        target=_instance_heartbeat_loop,
+        args=(store, worker_id, settings.heartbeat_seconds, heartbeat_stop),
+        name=f"instance-heartbeat-{worker_id[-12:]}",
+        daemon=True,
+    )
+    heartbeat.start()
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        # Clean exit: prove this instance is gone (release its in-flight
+        # leases and drop its registration) so the next instance's first
+        # resubmission recovers its interrupted jobs immediately.
+        heartbeat_stop.set()
+        store.expire_own_leases(worker_id)
+        store.deregister_instance(worker_id)
 
     app = FastAPI(
         title="DICOM Research Data Anonymization API",
         version="1.0.0",
         description=DESCRIPTION,
+        lifespan=lifespan,
     )
+    app.state.worker_id = worker_id
 
     @app.post("/jobs", status_code=202, response_model=JobCreated)
     def create_job(
@@ -248,9 +340,43 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         # queued/processing: either still being executed somewhere or
         # interrupted. The store atomically decides which; only the claimant
         # (re)schedules execution.
+        current = record
         claimed = store.try_claim(
-            job_id, secret_fp, worker_id, time.time() + settings.lease_seconds
+            job_id,
+            secret_fp,
+            worker_id,
+            time.time() + settings.lease_seconds,
+            settings.lease_seconds,
         )
+        owner = record["lease_owner"]
+        owner_executing = owner == worker_id
+        if not claimed and owner and owner != worker_id:
+            if store.instance_last_seen(owner) is not None:
+                # The lease is held by a registered peer instance. Its fate
+                # is not decidable from a single snapshot, so wait for it to
+                # resolve: a live peer renews its lease/registration (and
+                # keeps the job), a dead one lets the lease lapse, and this
+                # request then takes over atomically.
+                outcome, current = _await_lease_resolution(
+                    store, job_id, secret_fp, worker_id, settings, record
+                )
+                if outcome == "terminal":
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "job_id": job_id,
+                            "status": current["status"],
+                            "status_url": f"/jobs/{job_id}",
+                            "detail": "identical submission already exists; returning the existing job",
+                        },
+                    )
+                if outcome == "claimed":
+                    claimed = True
+                elif outcome == "active":
+                    owner_executing = True
+            # Unregistered lease owner (legacy/foreign row): its fate cannot
+            # be verified, so nothing is waited out here — the lease lapses on
+            # its own and a later resubmission takes over atomically.
         resumed = False
         if claimed:
             # Execute with the persisted policy/redactions so the resumed job
@@ -264,17 +390,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             resumed = runner.maybe_schedule(
                 background_tasks, job_id, content, record_policy, record_redactions
             )
+        if resumed:
+            detail = "existing job was interrupted; execution resumed under the original job id"
+        elif owner_executing:
+            detail = (
+                "identical submission already exists and is still being executed; "
+                "returning the existing job"
+            )
+        else:
+            detail = "identical submission already exists; returning the existing job"
         return JSONResponse(
             status_code=200,
             content={
                 "job_id": job_id,
-                "status": record["status"],
+                "status": current["status"],
                 "status_url": f"/jobs/{job_id}",
-                "detail": (
-                    "existing job was interrupted; execution resumed under the original job id"
-                    if resumed
-                    else "identical submission already exists; returning the existing job"
-                ),
+                "detail": detail,
             },
         )
 

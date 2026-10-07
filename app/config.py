@@ -38,11 +38,14 @@ class Settings:
     data_dir: str
     secret: str
     #: Seconds an executor's lease on a job stays valid without a heartbeat.
-    #: A crashed executor stops heartbeating, so its queued/processing jobs
-    #: become claimable once the lease lapses (or immediately after a restart,
-    #: which invalidates the previous instance's leases outright).
+    #: Doubles as the liveness window for instance registrations: a peer
+    #: instance whose registry heartbeat is older than this is considered
+    #: gone. A crashed executor stops heartbeating, so its queued/processing
+    #: jobs become claimable once the lease lapses — or immediately once the
+    #: owner is verifiably gone (clean shutdown or stale registration).
     lease_seconds: float = 30.0
-    #: Interval between lease renewals while a job runs.
+    #: Interval between lease renewals while a job runs; the instance
+    #: liveness registration is refreshed on the same interval.
     heartbeat_seconds: float = 10.0
 
     @property

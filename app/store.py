@@ -1,10 +1,15 @@
 """SQLite-backed job store.
 
 Job rows carry an execution *lease* (``lease_owner`` / ``lease_expires``) in
-addition to their lifecycle status. The lease is what lets a restarted (or
-concurrent) process tell a live executor from a dead one: every state
-transition an executor performs is a conditional single-statement UPDATE, so
-SQLite itself serializes competing processes and exactly one claimant wins.
+addition to their lifecycle status, and every running service instance keeps
+a liveness registration (``instances`` table) fresh with a periodic
+heartbeat. Together they let any process sharing the database tell a live
+executor from a dead one: a lease whose owner still heartbeats belongs to a
+live executor and is never taken; a lease whose owner stopped heartbeating
+(or never registered) belongs to a dead one and may be taken over. Every
+state transition an executor performs is a conditional single-statement
+UPDATE, so SQLite itself serializes competing processes and exactly one
+claimant wins.
 """
 from __future__ import annotations
 
@@ -32,6 +37,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     audit_json     TEXT,
     errors_json    TEXT
 );
+CREATE TABLE IF NOT EXISTS instances (
+    instance_id    TEXT PRIMARY KEY,
+    started_at     TEXT NOT NULL,
+    last_seen      REAL NOT NULL
+);
 """
 
 
@@ -42,7 +52,9 @@ def _utcnow() -> str:
 class JobStore:
     def __init__(self, db_path: str) -> None:
         self._lock = threading.Lock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # The busy timeout lets concurrent instances' writers serialize on the
+        # SQLite file lock instead of failing with "database is locked".
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
@@ -127,26 +139,74 @@ class JobStore:
         return dict(row) if row else None
 
     # ------------------------------------------------------------------
+    # Instance liveness registry
+    # ------------------------------------------------------------------
+    def register_instance(self, instance_id: str) -> None:
+        """Insert (or refresh) this instance's liveness registration."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO instances (instance_id, started_at, last_seen) VALUES (?, ?, ?)"
+                " ON CONFLICT(instance_id) DO UPDATE SET started_at = excluded.started_at,"
+                " last_seen = excluded.last_seen",
+                (instance_id, _utcnow(), time.time()),
+            )
+
+    def heartbeat_instance(self, instance_id: str) -> None:
+        """Renew the registration. A live instance calls this periodically."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instances SET last_seen = ? WHERE instance_id = ?",
+                (time.time(), instance_id),
+            )
+
+    def instance_last_seen(self, instance_id: str) -> Optional[float]:
+        """Return the instance's last heartbeat timestamp, None if unknown."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_seen FROM instances WHERE instance_id = ?", (instance_id,)
+            ).fetchone()
+        return float(row["last_seen"]) if row else None
+
+    def deregister_instance(self, instance_id: str) -> None:
+        """Remove the registration (clean shutdown)."""
+        with self._lock, self._conn:
+            self._conn.execute("DELETE FROM instances WHERE instance_id = ?", (instance_id,))
+
+    # ------------------------------------------------------------------
     # Lease arbitration (single-statement conditional UPDATEs)
     # ------------------------------------------------------------------
-    def try_claim(self, job_id: str, secret_fp: str, owner: str, lease_expires: float) -> bool:
+    def try_claim(
+        self, job_id: str, secret_fp: str, owner: str, lease_expires: float, owner_ttl: float
+    ) -> bool:
         """Atomically take over execution rights for an interrupted job.
 
-        Succeeds iff the row is still ``queued`` (no executor ever started) or
-        sits in ``processing`` with an expired/absent lease — i.e. the previous
-        executor is provably gone. A fresh lease means the job is actively
-        being worked on and the claim is refused. Because the UPDATE is one
-        statement, concurrent claimants across processes are serialized by
-        SQLite and exactly one of them observes ``rowcount == 1``.
+        Succeeds iff the row is ``queued``/``processing`` AND its lease cannot
+        belong to a live executor:
+
+        * the lease is absent (legacy row) or has lapsed — the previous
+          executor stopped renewing it, or
+        * the lease owner is a registered instance whose liveness heartbeat
+          is older than ``owner_ttl`` seconds — it provably stopped
+          heartbeating, i.e. it is gone.
+
+        A fresh lease held by a live (or unverifiable) owner is never taken,
+        whether the row is queued or already processing: the job is actively
+        being executed somewhere and claiming it would run it twice. Because
+        the UPDATE is one statement, concurrent claimants across processes
+        are serialized by SQLite and exactly one of them observes
+        ``rowcount == 1``.
         """
+        now = time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE jobs SET lease_owner = ?, lease_expires = ?"
                 " WHERE job_id = ? AND secret_fp = ?"
-                " AND (status = 'queued'"
-                "      OR (status = 'processing'"
-                "          AND (lease_expires IS NULL OR lease_expires <= ?)))",
-                (owner, lease_expires, job_id, secret_fp, time.time()),
+                " AND status IN ('queued', 'processing')"
+                " AND (lease_expires IS NULL"
+                "      OR lease_expires <= ?"
+                "      OR lease_owner IN (SELECT instance_id FROM instances"
+                "                         WHERE last_seen <= ?))",
+                (owner, lease_expires, job_id, secret_fp, now, now - owner_ttl),
             )
             return cur.rowcount == 1
 
@@ -176,21 +236,42 @@ class JobStore:
             )
             return cur.rowcount == 1
 
-    def expire_foreign_leases(self, owner: str) -> int:
-        """Invalidate every queued/processing lease not held by *owner*.
+    def expire_foreign_leases(self, owner: str, owner_ttl: float) -> int:
+        """Invalidate queued/processing leases whose owner is verifiably gone.
 
-        Called once at startup: under the single-instance deployment model a
-        new process for the same DATA_DIR means the previous instance is gone,
-        so its in-flight jobs become claimable immediately instead of only
-        after their leases lapse. Live executors are unaffected in practice:
-        worst case a wrongly-expired lease is re-acquired by the claimant and
-        the deterministic pipeline simply runs twice with identical output.
+        Called once at startup. A lease owner is verifiably gone when it is
+        not a live registered instance: either it never registered (legacy or
+        foreign rows) or its liveness heartbeat is older than ``owner_ttl``
+        seconds. Their jobs become claimable on the very next resubmission
+        instead of only after the lease timeout.
+
+        Leases of instances with a fresh heartbeat are left untouched: those
+        executors are still alive (e.g. a second instance sharing this
+        DATA_DIR), and preempting their jobs would execute them twice.
         """
+        now = time.time()
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "UPDATE jobs SET lease_expires = 0"
                 " WHERE status IN ('queued', 'processing')"
-                " AND (lease_owner IS NULL OR lease_owner != ?)",
+                " AND lease_owner IS NOT NULL AND lease_owner != ?"
+                " AND lease_owner NOT IN (SELECT instance_id FROM instances"
+                "                         WHERE last_seen > ?)",
+                (owner, now - owner_ttl),
+            )
+            return cur.rowcount
+
+    def expire_own_leases(self, owner: str) -> int:
+        """Invalidate this instance's own in-flight leases (clean shutdown).
+
+        Proves to the next instance that this executor is gone, so its
+        interrupted jobs become claimable on the very first resubmission
+        instead of only after the lease timeout.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE jobs SET lease_expires = 0"
+                " WHERE status IN ('queued', 'processing') AND lease_owner = ?",
                 (owner,),
             )
             return cur.rowcount

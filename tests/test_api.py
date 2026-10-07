@@ -1171,6 +1171,191 @@ def test_old_database_is_migrated_with_lease_columns(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Multi-instance arbitration (two instances sharing DATA_DIR + ANON_SECRET)
+# ---------------------------------------------------------------------------
+def test_live_peer_job_is_not_preempted(tmp_path):
+    """Two live instances on one DATA_DIR: a resubmission to the second
+    instance must not steal a job owned by the first. The second instance
+    waits for the owner to prove itself alive, then returns the original id
+    without scheduling a duplicate execution."""
+    settings = Settings(
+        data_dir=str(tmp_path), secret=SECRET, lease_seconds=5.0, heartbeat_seconds=0.5
+    )
+    app_a = create_app(settings)
+    app_b = create_app(settings)
+    payload = three_instance_zip()
+    with TestClient(app_a), TestClient(app_b) as client_b:
+        # an in-flight job owned by live instance A (A's liveness heartbeat
+        # keeps renewing its registration while B arbitrates)
+        job_id = plant_interrupted_job(
+            tmp_path,
+            payload,
+            BASE_POLICY,
+            status="processing",
+            lease_expires=time.time() + 300,
+            owner=app_a.state.worker_id,
+        )
+        response = client_b.post(
+            "/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["job_id"] == job_id  # original id returned
+        assert "resumed" not in body["detail"]  # ... but no takeover happened
+        # still owned by A, still processing, not re-executed by B
+        record = JobStore(str(tmp_path / "jobs.db")).get(job_id)
+        assert record["status"] == "processing"
+        assert record["lease_owner"] == app_a.state.worker_id
+
+
+def test_crashed_peer_job_is_claimable_on_first_resubmit(tmp_path):
+    """A job whose owner registered but stopped heartbeating (crashed) is
+    taken over on the first resubmission: the stale registration proves the
+    old executor is gone even though its job lease is still fresh."""
+    settings = Settings(
+        data_dir=str(tmp_path), secret=SECRET, lease_seconds=5.0, heartbeat_seconds=0.5
+    )
+    app = create_app(settings)
+    payload = three_instance_zip()
+    with TestClient(app) as client:
+        store = JobStore(str(tmp_path / "jobs.db"))
+        store.register_instance("crashed-peer")
+        with store._conn:  # the peer's last heartbeat is long past: it is gone
+            store._conn.execute(
+                "UPDATE instances SET last_seen = ? WHERE instance_id = ?",
+                (time.time() - 3600, "crashed-peer"),
+            )
+        job_id = plant_interrupted_job(
+            tmp_path,
+            payload,
+            BASE_POLICY,
+            status="processing",
+            lease_expires=time.time() + 3600,  # job lease itself still fresh
+            owner="crashed-peer",
+        )
+        response = client.post(
+            "/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+        )
+        assert response.status_code == 200
+        assert response.json()["job_id"] == job_id
+        assert "resumed" in response.json()["detail"]
+        assert get_job(client, job_id)["status"] == "done"
+        _, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+        assert download(client, job_id) == expected
+
+
+def test_unverifiable_peer_takeover_waits_for_lease_expiry(tmp_path):
+    """Owner registered with a fresh heartbeat but silent afterwards (fate
+    unconfirmable): the resubmission waits out the lease, then takes over
+    atomically and resumes under the original id."""
+    settings = Settings(
+        data_dir=str(tmp_path), secret=SECRET, lease_seconds=2.0, heartbeat_seconds=0.5
+    )
+    app = create_app(settings)
+    payload = three_instance_zip()
+    with TestClient(app) as client:
+        store = JobStore(str(tmp_path / "jobs.db"))
+        store.register_instance("silent-peer")  # fresh registration, never renewed
+        job_id = plant_interrupted_job(
+            tmp_path,
+            payload,
+            BASE_POLICY,
+            status="processing",
+            lease_expires=time.time() + 2,
+            owner="silent-peer",
+        )
+        started = time.time()
+        response = client.post(
+            "/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+        )
+        elapsed = time.time() - started
+        assert response.status_code == 200
+        assert response.json()["job_id"] == job_id
+        assert "resumed" in response.json()["detail"]
+        assert elapsed >= 1.5  # it waited for the lease to lapse before claiming
+        assert get_job(client, job_id)["status"] == "done"
+
+
+def test_displaced_executor_late_writes_do_not_overwrite_takeover(tmp_path):
+    """After a takeover, the old executor's late heartbeat and completion
+    writes are refused by the lease guards and cannot clobber the result."""
+    settings = Settings(
+        data_dir=str(tmp_path), secret=SECRET, lease_seconds=5.0, heartbeat_seconds=0.5
+    )
+    app = create_app(settings)
+    payload = three_instance_zip()
+    with TestClient(app) as client:
+        store = JobStore(str(tmp_path / "jobs.db"))
+        store.register_instance("crashed-peer")
+        with store._conn:
+            store._conn.execute(
+                "UPDATE instances SET last_seen = ? WHERE instance_id = ?",
+                (time.time() - 3600, "crashed-peer"),
+            )
+        job_id = plant_interrupted_job(
+            tmp_path,
+            payload,
+            BASE_POLICY,
+            status="processing",
+            lease_expires=time.time() + 3600,
+            owner="crashed-peer",
+        )
+        response = client.post(
+            "/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+        )
+        assert "resumed" in response.json()["detail"]
+        status = get_job(client, job_id)
+        assert status["status"] == "done"
+
+        # the displaced executor wakes up late and tries to publish its outcome
+        assert not store.renew_lease(job_id, "crashed-peer", time.time() + 30)
+        assert not store.begin_processing(job_id, "crashed-peer", time.time() + 30)
+        assert not store.set_done(job_id, "crashed-peer", "/tmp/late.zip", "0" * 64, {})
+        assert not store.set_failed(
+            job_id, "crashed-peer", [{"file": None, "code": "LATE", "message": "late"}]
+        )
+        # the takeover result is untouched
+        after = get_job(client, job_id)
+        assert after["status"] == "done"
+        assert after["result"]["sha256"] == status["result"]["sha256"]
+        _, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+        assert download(client, job_id) == expected
+
+
+def test_clean_shutdown_releases_in_flight_jobs(tmp_path):
+    """A gracefully stopped instance releases its leases and deregisters, so
+    the next instance's first resubmission recovers the job immediately."""
+    settings = Settings(
+        data_dir=str(tmp_path), secret=SECRET, lease_seconds=30.0, heartbeat_seconds=1.0
+    )
+    app_a = create_app(settings)
+    payload = three_instance_zip()
+    with TestClient(app_a):
+        job_id = plant_interrupted_job(
+            tmp_path,
+            payload,
+            BASE_POLICY,
+            status="processing",
+            lease_expires=time.time() + 3600,
+            owner=app_a.state.worker_id,
+        )
+    # leaving the context ran the shutdown hook: A's leases were released
+    client, response = resubmit(tmp_path, payload, BASE_POLICY)
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert "resumed" in response.json()["detail"]
+    assert get_job(client, job_id)["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
 # Crash recovery across a real process restart (SIGKILL -> restart -> resume)
 # ---------------------------------------------------------------------------
 def _free_port() -> int:
@@ -1293,3 +1478,63 @@ def test_crash_recovery_across_process_restart(tmp_path, instances):
     finally:
         proc.kill()
         proc.wait()
+
+
+@pytest.mark.parametrize("instances", [300])
+def test_active_job_not_preempted_by_second_server(tmp_path, instances):
+    """Two live server processes sharing DATA_DIR and ANON_SECRET: the job
+    runs on server A; resubmitting verbatim to server B must return the
+    original job id without taking over or duplicating the execution."""
+    import httpx
+
+    files = {
+        f"inst/{i:04d}.dcm": make_dcm("7.7.1", "7.7.2", f"7.7.3.{i}", instance_number=i)
+        for i in range(instances)
+    }
+    payload = make_zip(files)
+    port_a, port_b = _free_port(), _free_port()
+    proc_a = _start_server(tmp_path / "data", port_a, SECRET)
+    proc_b = _start_server(tmp_path / "data", port_b, SECRET)
+    try:
+        _wait_ready(port_a)
+        _wait_ready(port_b)
+        resp = httpx.post(
+            f"http://127.0.0.1:{port_a}/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+            timeout=60,
+        )
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+
+        # verbatim resubmission to the *other* live instance: it must not
+        # preempt A's execution — no takeover, no duplicate run
+        resp = httpx.post(
+            f"http://127.0.0.1:{port_b}/jobs",
+            files={"file": ("input.zip", payload, "application/zip")},
+            data={"policy": json.dumps(BASE_POLICY)},
+            timeout=60,
+        )
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == job_id
+        assert "resumed" not in (resp.json().get("detail") or "")
+
+        # the job completes exactly once, under the original id
+        deadline = time.time() + 90
+        while True:
+            status = httpx.get(f"http://127.0.0.1:{port_b}/jobs/{job_id}", timeout=5).json()
+            if status["status"] == "done":
+                break
+            assert status["status"] in ("queued", "processing"), status
+            assert time.time() < deadline, "job did not finish in time"
+            time.sleep(0.5)
+        dl = httpx.get(f"http://127.0.0.1:{port_b}/jobs/{job_id}/download", timeout=30)
+        assert dl.status_code == 200
+        assert hashlib.sha256(dl.content).hexdigest() == status["result"]["sha256"]
+        errors, expected, _, _ = anonymize_zip(payload, BASE_POLICY, None, SECRET)
+        assert errors == []
+        assert dl.content == expected
+    finally:
+        for proc in (proc_a, proc_b):
+            proc.kill()
+            proc.wait()

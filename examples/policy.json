@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "salt": "demo-research-project",
+  "remove_private_tags": true,
+  "strict_references": true,
+  "date_shift": { "enabled": true, "max_days": 365 },
+  "tags": {
+    "keep": ["PatientSex", "PatientAge", "StudyDescription"],
+    "hash": ["PatientID"],
+    "remove": ["RequestAttributesSequence"],
+    "replace": { "ReferringPhysicianName": "ANON^MD" }
+  }
+}
